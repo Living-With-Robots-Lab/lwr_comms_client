@@ -1,0 +1,10 @@
+robot_name: "bender"
+server_uri: "ws://10.2.0.60:8080"
+
+publish_topics:
+  - name: "/cmd_vel"
+    type: "geometry_msgs.msg.Twist"
+
+subscribe_topics:
+  - name: "/bender/cmd_vel"
+    type: "geometry_msgs.msg.Twist"
