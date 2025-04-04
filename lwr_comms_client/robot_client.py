@@ -7,9 +7,9 @@ from rclpy.node import Node
 from rclpy.serialization import serialize_message, deserialize_message
 import base64
 import threading
-from sensor_msgs.msg import LaserScan
-from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 import importlib
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
+
 # QoS profile for ROS 2 message reliability
 qos_profile = QoSProfile(
     reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -19,6 +19,7 @@ qos_profile = QoSProfile(
 
 ws_connection = None
 ws_loop = None
+robot_client_instance = None  # Global reference for RobotClient instance
 
 async def ws_client(uri, config):
     """WebSocket client that maintains connection with the server."""
@@ -33,71 +34,56 @@ async def ws_client(uri, config):
                     "subscribe_topics": config.get("subscribe_topics", [])
                 }
                 await websocket.send(json.dumps(reg_msg))
-
                 while True:
                     try:
                         message = await websocket.recv()
                         data = json.loads(message)
-                        print("brother?")
+                        print("[Client] Received from server:", data)
                         handle_server_message(data)
                     except websockets.ConnectionClosed:
                         print("WebSocket connection lost, attempting to reconnect...")
-                        break  # Break inner loop to reconnect
+                        break
         except Exception as e:
             print(f"WebSocket connection error: {e}, retrying in 5 seconds...")
-            await asyncio.sleep(5)  # Wait before reconnecting
+            await asyncio.sleep(5)
 
 def handle_server_message(data):
     """Processes incoming messages from the WebSocket server."""
+    global robot_client_instance
     topic = data.get("topic")
-    encoded_msg = data.get("data")
-    
-    # print(f"Received message from WebSocket: {data}")  # Debugging print
+    payload = data.get("data")  # Extract the full payload dictionary
 
-    if topic and encoded_msg:
-        if topic in RobotClient.subscribers:
+    if topic and payload and topic in robot_client_instance.subscribers:
+        encoded_msg = payload.get("data")  # Extract the actual base64 string
+        if encoded_msg:
             serialized_msg = base64.b64decode(encoded_msg)
-            msg_type = RobotClient.subscribers[topic]["msg_type"]
+            msg_type = robot_client_instance.subscribers[topic]["msg_type"]
             msg = deserialize_message(serialized_msg, msg_type)
-            # print(f"Publishing on {topic}: {msg}")  # Debugging print
-            RobotClient.subscribers[topic]["publisher"].publish(msg)
-
-# def send_message_to_server(topic, data):
-#     """Sends a message to the WebSocket server asynchronously."""
-#     global ws_loop, ws_connection
-#     if ws_connection and ws_connection.open:
-#         async def send():
-#             payload = {"topic": topic, "data": data}
-#             try:
-#                 # print("sending data")
-#                 await ws_connection.send(json.dumps(payload))
-#             except Exception as e:
-#                 print(f"Error sending message: {e}")
-        
-#         asyncio.run_coroutine_threadsafe(send(), ws_loop)
-
-async def reconnect_websocket():
-    global ws_connection
-    print("[Client] Reconnecting to WebSocket...")
-    try:
-        ws_connection = await websockets.connect("ws://your_server_address")
-        print("[Client] Reconnected successfully.")
-    except Exception as e:
-        print(f"[Client] Reconnection failed: {e}")
-        await asyncio.sleep(5)  # Wait before retrying
-        await reconnect_websocket()  # Try again
+            robot_client_instance.subscribers[topic]["publisher"].publish(msg)
 
 async def send_message_to_server(topic, data):
-    global ws_connection  
+    """Sends a message to the WebSocket server asynchronously."""
+    global ws_connection
     try:
         if ws_connection and ws_connection.state == websockets.protocol.State.OPEN:
             payload = json.dumps({"topic": topic, "data": data})
-            await ws_connection.send(payload)  # Use await here
+            await ws_connection.send(payload)
         else:
             print("[Client] WebSocket connection is closed. Reconnecting...")
             await reconnect_websocket()
     except Exception as e:
         print(f"[Client] Failed to send message: {e}")
+        await reconnect_websocket()
+
+async def reconnect_websocket():
+    global ws_connection
+    print("[Client] Reconnecting to WebSocket...")
+    try:
+        ws_connection = await websockets.connect("ws://10.2.0.60:8080")
+        print("[Client] Reconnected successfully.")
+    except Exception as e:
+        print(f"[Client] Reconnection failed: {e}")
+        await asyncio.sleep(5)
         await reconnect_websocket()
 
 def start_ws_client(config):
@@ -108,10 +94,11 @@ def start_ws_client(config):
     ws_loop.run_until_complete(ws_client(server_uri, config))
 
 class RobotClient(Node):
-    subscribers = {}
-
     def __init__(self, config):
         super().__init__('robot_client')
+        global robot_client_instance
+        robot_client_instance = self  # Assign global instance reference
+
         self.robot_name = config.get("robot_name")
         self.publish_topics = config.get("publish_topics", [])
         self.subscribe_topics = config.get("subscribe_topics", [])
@@ -119,7 +106,7 @@ class RobotClient(Node):
 
         self.get_logger().info(f"Robot '{self.robot_name}' started. Publishing: {self.publish_topics}, Subscribing: {self.subscribe_topics}")
 
-        # Set up publishing
+        # Set up publishers: subscribe to local ROS topics and forward messages via WebSocket.
         for topic_info in self.publish_topics:
             topic_name = topic_info["name"]
             msg_type = self.get_msg_type(topic_info["type"])
@@ -127,7 +114,7 @@ class RobotClient(Node):
                 self.create_subscription(msg_type, topic_name, self.get_message_callback(topic_name), qos_profile)
                 self.get_logger().info(f"Publishing topic: {topic_name}")
 
-        # Set up subscriptions
+        # Set up subscriptions: receive messages from server and publish them locally.
         for topic_info in self.subscribe_topics:
             topic_name = topic_info["name"]
             msg_type = self.get_msg_type(topic_info["type"])
@@ -144,7 +131,7 @@ class RobotClient(Node):
             return getattr(module, class_name)
         except Exception as e:
             self.get_logger().error(f"Failed to import message type '{msg_type_str}': {e}")
-            return None                
+            return None
 
     def get_message_callback(self, topic):
         """Returns a callback function for publishing messages to WebSocket."""
@@ -152,24 +139,23 @@ class RobotClient(Node):
             serialized = serialize_message(msg)
             encoded_msg = base64.b64encode(serialized).decode('utf-8')
             msg_type = f"{msg.__class__.__module__}.{msg.__class__.__name__}"
-            data = {"msg_type": msg_type, "message": encoded_msg}
-            send_message_to_server(topic, data)
+            data = {"msg_type": msg_type, "data": encoded_msg}
+            # Schedule asynchronous send using the WebSocket event loop
+            asyncio.run_coroutine_threadsafe(send_message_to_server(topic, data), ws_loop)
         return callback
 
 def main(args=None):
-    """Main function to start the ROS 2 node and WebSocket client."""
     with open("/home/bwidemo/bwi_ros2/src/lwr_comms_client/configs/robot_config.yaml", "r") as f:
         config = yaml.safe_load(f)
 
-    # Start WebSocket client in a separate thread
+    # Start the WebSocket client in a separate thread
     ws_thread = threading.Thread(target=start_ws_client, args=(config,))
     ws_thread.daemon = True
     ws_thread.start()
 
-    # Initialize ROS 2 node
     rclpy.init(args=args)
     robot_node = RobotClient(config)
-
+    
     try:
         rclpy.spin(robot_node)
     except KeyboardInterrupt:

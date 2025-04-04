@@ -6,5 +6,5 @@ publish_topics:
     type: "geometry_msgs.msg.Twist"
 
 subscribe_topics:
-  - name: "/bender/cmd_vel"
+  - name: "/flexo/cmd_vel"
     type: "geometry_msgs.msg.Twist"
